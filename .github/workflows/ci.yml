@@ -5,6 +5,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      pull_request:
+        description: 'Approved same-repository pull request into develop (optional)'
+        type: number
+        required: false
   pull_request:
     types: [opened, edited, reopened, synchronize, review_requested]
     branches:
@@ -32,13 +37,14 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   review-check:
-    if: github.event.pull_request.base.ref == 'develop'
+    if: github.event.pull_request.base.ref == 'develop' || (github.event_name == 'workflow_dispatch' && inputs.pull_request > 0)
     needs: test
     permissions:
       pull-requests: read
     runs-on: ubuntu-latest
     steps:
       - name: Check the target branch
+        if: github.event_name != 'workflow_dispatch'
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: test "$BASE_REF" = "develop"
@@ -46,7 +52,19 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const pullNumber = context.payload.pull_request.number;
+            const manual = context.eventName === 'workflow_dispatch';
+            const pullNumber = manual ? Number(context.payload.inputs.pull_request) : context.payload.pull_request.number;
+            if (manual) {
+              const { data: pull } = await github.rest.pulls.get({
+                ...context.repo, pull_number: pullNumber
+              });
+              if (pull.state !== 'open' || pull.base.ref !== 'develop' ||
+                  pull.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                  pull.head.sha !== context.sha) {
+                core.setFailed('Run this workflow on the same-repository head of an open pull request into develop.');
+                return;
+              }
+            }
             const reviews = await github.paginate(
               github.rest.pulls.listReviews,
               { owner: context.repo.owner, repo: context.repo.repo, pull_number: pullNumber }
@@ -71,7 +89,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    if: github.event.pull_request.base.ref == 'develop'
+    if: github.event.pull_request.base.ref == 'develop' || (github.event_name == 'workflow_dispatch' && inputs.pull_request > 0)
     needs: [test, review-check]
     runs-on: ubuntu-latest
     steps:
@@ -118,7 +136,12 @@ jobs:
       !cancelled() &&
       needs.test.result == 'success' &&
       (
-        ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          ((inputs.pull_request > 0 && needs.review-check.result == 'success') ||
+           (!(inputs.pull_request > 0) && github.ref == 'refs/heads/main'))
+        ) ||
         (
           github.event_name == 'pull_request_review' &&
           github.event.pull_request.base.ref == 'develop' &&
@@ -158,7 +181,7 @@ jobs:
       - name: Wait for SonarQube to start
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 120); do
+          for ((attempt = 1; attempt <= 120; attempt++)); do
             status=$(curl --silent --show-error --max-time 5 http://127.0.0.1:9000/api/system/status || true)
             if [[ "$status" == *'"status":"UP"'* ]]; then
               echo "SonarQube is ready."
@@ -199,6 +222,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --workdir "$GITHUB_WORKSPACE" \
             "$SCANNER_IMAGE" \
+            "-Dsonar.working.directory=$GITHUB_WORKSPACE/.scannerwork" \
             -Dsonar.qualitygate.wait=true \
             -Dsonar.qualitygate.timeout=300
           echo 'SonarQube analysis completed and the Quality Gate passed.' >> "$GITHUB_STEP_SUMMARY"
