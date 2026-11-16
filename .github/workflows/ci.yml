@@ -1,6 +1,10 @@
 name: CI Pipeline
 
 on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
   pull_request:
     types: [opened, edited, reopened, synchronize, review_requested]
     branches:
@@ -13,7 +17,7 @@ permissions:
 
 jobs:
   test:
-    if: github.event_name == 'pull_request' || github.event.pull_request.base.ref == 'develop'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event.pull_request.base.ref == 'develop'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source code
@@ -96,7 +100,6 @@ jobs:
           reporter: github-pr-review
           level: info
           filter_mode: added
-          fail_level: none
       - name: Count lines of code
         run: |
           sudo apt-get update
@@ -111,18 +114,99 @@ jobs:
           retention-days: 14
 
   sonarqube:
-    if: vars.SONAR_HOST_URL != '' && github.event.pull_request.base.ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      !cancelled() &&
+      needs.test.result == 'success' &&
+      (
+        ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') ||
+        (
+          github.event_name == 'pull_request_review' &&
+          github.event.pull_request.base.ref == 'develop' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.review-check.result == 'success'
+        )
+      )
     needs: [test, review-check]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
-    env:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
     steps:
       - name: Check out source code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Run SonarQube
-        if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@v8.3.0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate coverage data
+        run: |
+          python -m pip install --disable-pip-version-check coverage
+          python -m coverage run --source=src -m unittest discover -s tests -v
+          python -m coverage xml
+      - name: Start an isolated SonarQube server
+        env:
+          SONARQUBE_IMAGE: sonarqube@sha256:65541accbdb92e27fe770fc6ba99988a3dd5a0c71ffafd67f88abfad366996fa
+        run: |
+          set -euo pipefail
+          sudo sysctl -w vm.max_map_count=524288
+          docker run --detach --name lab06-sonarqube \
+            --publish 127.0.0.1:9000:9000 \
+            --env SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
+            "$SONARQUBE_IMAGE"
+      - name: Wait for SonarQube to start
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            status=$(curl --silent --show-error --max-time 5 http://127.0.0.1:9000/api/system/status || true)
+            if [[ "$status" == *'"status":"UP"'* ]]; then
+              echo "SonarQube is ready."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SonarQube did not start within 10 minutes." >&2
+          exit 1
+      - name: Run SonarQube analysis and check the quality gate
+        env:
+          SCANNER_IMAGE: sonarsource/sonar-scanner-cli@sha256:6e6eca4d552695a98fb7dab84f0c1bd0885ebbfe272654d1552e24bd7f452d51
+        run: |
+          set -euo pipefail
+          credential_file="$RUNNER_TEMP/sonarqube.netrc"
+          admin_password="Runner-$(openssl rand -hex 24)!A9"
+          printf 'machine 127.0.0.1\nlogin admin\npassword admin\n' > "$credential_file"
+          chmod 600 "$credential_file"
+
+          curl --fail --silent --show-error --netrc-file "$credential_file" \
+            --request POST http://127.0.0.1:9000/api/users/change_password \
+            --data-urlencode 'login=admin' \
+            --data-urlencode "password=$admin_password" \
+            --data-urlencode 'previousPassword=admin'
+          printf 'machine 127.0.0.1\nlogin admin\npassword %s\n' "$admin_password" > "$credential_file"
+          token_response=$(curl --fail --silent --show-error --netrc-file "$credential_file" \
+            --request POST http://127.0.0.1:9000/api/user_tokens/generate \
+            --data-urlencode "name=lab06-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          sonar_token=$(jq --exit-status --raw-output '.token | select(type == "string" and length > 0)' <<< "$token_response")
+          echo "::add-mask::$sonar_token"
+          rm -f "$credential_file"
+
+          docker run --rm --network host \
+            --user "$(id -u):$(id -g)" \
+            --env SONAR_HOST_URL=http://127.0.0.1:9000 \
+            --env SONAR_TOKEN="$sonar_token" \
+            --env SONAR_USER_HOME=/tmp/.sonar \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            "$SCANNER_IMAGE" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+          echo 'SonarQube analysis completed and the Quality Gate passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Show SonarQube logs on failure
+        if: failure()
+        run: docker logs lab06-sonarqube || true
+      - name: Stop the temporary SonarQube server
+        if: always()
+        run: |
+          docker rm --force --volumes lab06-sonarqube >/dev/null 2>&1 || true
+          rm -f "$RUNNER_TEMP/sonarqube.netrc"
