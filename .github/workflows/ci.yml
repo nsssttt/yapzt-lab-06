@@ -1,0 +1,128 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, review_requested]
+    branches:
+      - develop
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request' || github.event.pull_request.base.ref == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  review-check:
+    if: github.event.pull_request.base.ref == 'develop'
+    needs: test
+    permissions:
+      pull-requests: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the target branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: test "$BASE_REF" = "develop"
+      - name: Check the latest review decisions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pullNumber = context.payload.pull_request.number;
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              { owner: context.repo.owner, repo: context.repo.repo, pull_number: pullNumber }
+            );
+            const latestByUser = new Map();
+            for (const review of reviews) {
+              if (review.user && review.submitted_at) {
+                const previous = latestByUser.get(review.user.login);
+                if (!previous || previous.submitted_at < review.submitted_at) {
+                  latestByUser.set(review.user.login, review);
+                }
+              }
+            }
+            const latest = [...latestByUser.values()];
+            core.info(JSON.stringify(latest.map(({ user, state, submitted_at }) =>
+              ({ user: user.login, state, submitted_at })), null, 2));
+            if (!latest.some(review => review.state === 'APPROVED')) {
+              core.setFailed('The pull request into develop has no active approval.');
+            }
+
+  analysis:
+    permissions:
+      contents: read
+      pull-requests: write
+    if: github.event.pull_request.base.ref == 'develop'
+    needs: [test, review-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Post flake8 findings to the pull request
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: reviewdog/action-flake8@v3.15.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          level: error
+          filter_mode: added
+          fail_level: error
+      - name: Post Black findings to the pull request
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: reviewdog/action-black@v3.22.4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          level: info
+          filter_mode: added
+          fail_level: none
+      - name: Count lines of code
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloc
+          cloc src --json --out=cloc-report.json
+          cat cloc-report.json
+      - name: Upload the Cloc report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloc-report
+          path: cloc-report.json
+          retention-days: 14
+
+  sonarqube:
+    if: vars.SONAR_HOST_URL != '' && github.event.pull_request.base.ref == 'develop' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [test, review-check]
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run SonarQube
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
